@@ -14,13 +14,31 @@ log()  { printf '[*] %s\n' "$*"; }
 warn() { printf '[!] %s\n' "$*"; } 1>&2
 error(){ printf '[X] %s\n' "$*"; } 1>&2
 
+usage() {
+    cat <<'EOF'
+Usage: setup.sh [options]
+  --domain <domain>         Domain name for the deployment (required in non-interactive mode)
+  --ws-path <path>          WebSocket path (e.g., /ws)
+  --uuid <uuid>             UUID to use; auto-generated if omitted
+  --cover-site <y|n>        Whether to generate the fake cover website
+  --fresh-install <y|n>     Whether to run apt-get update/upgrade as a fresh install
+  --setup-ufw <y|n>         Configure and enable UFW with 22/80/443 allowed
+  --non-interactive|--yes   Accept defaults without prompts (domain is still required)
+  --help                    Show this message
+EOF
+}
+
 normalize_yn() {
     # Normalize y/n style inputs; returns empty string if invalid
-    case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    case "$(trim "$1" | tr 'A-Z' 'a-z')" in
         y|yes) echo "y" ;;
         n|no) echo "n" ;;
         *) echo "" ;;
     esac
+}
+
+trim() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 format_duration() {
@@ -106,19 +124,54 @@ prompt_yes_no() {
 }
 
 validate_domain() {
-    # Basic domain format validation
     local d="$1"
-    # No spaces
-    printf '%s' "$d" | grep -q ' ' && return 1
-    # Basic pattern: something.something
-    if printf '%s' "$d" | grep -Eq '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
-        # Reject leading '-' or '.' or trailing '.'; allow normal hyphens
-        case "$d" in
-            -*|.*|*.) return 1 ;;
+    local old_ifs label tld
+
+    [ -n "$d" ] || return 1
+    [ "${#d}" -le 253 ] || return 1
+    case "$d" in
+        *[!A-Za-z0-9.-]*|.*|*.|*..*|*.-*|*-.*) return 1 ;;
+    esac
+    case "$d" in
+        *.*) : ;;
+        *) return 1 ;;
+    esac
+
+    old_ifs=$IFS
+    IFS=.
+    set -- $d
+    IFS=$old_ifs
+    for label do
+        [ -n "$label" ] || return 1
+        [ "${#label}" -le 63 ] || return 1
+        case "$label" in
+            -*|*-) return 1 ;;
         esac
-        return 0
+    done
+
+    tld=${d##*.}
+    if [ "${#tld}" -lt 2 ] || ! printf '%s' "$tld" | grep -Eq '[A-Za-z]'; then
+        return 1
     fi
-    return 1
+    return 0
+}
+
+validate_uuid() {
+    printf '%s' "$1" | grep -Eiq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
+validate_ws_path() {
+    local p="$1"
+    [ -n "$p" ] || return 1
+    [ "$p" != "/" ] || return 1
+    case "$p" in
+        /*) : ;;
+        *) return 1 ;;
+    esac
+    case "$p" in
+        *//*|*/../*|*/..|*/./*|*/.) return 1 ;;
+    esac
+    printf '%s' "$p" | grep -Eq '^/[A-Za-z0-9._~/-]+$'
 }
 
 ensure_root() {
@@ -137,20 +190,23 @@ ensure_root() {
 url_encode() {
     # Use python3 for robust URL encoding of arbitrary characters
     if command -v python3 >/dev/null 2>&1; then
-        python3 - <<'PY' "$1"
+        if python3 - "$1" 2>/dev/null <<'PY'
 import sys, urllib.parse
-print(urllib.parse.quote(sys.argv[1]))
+print(urllib.parse.quote(sys.argv[1], safe=""))
 PY
-        return
+        then
+            return 0
+        fi
     fi
 
     if command -v jq >/dev/null 2>&1; then
-        printf '%s' "$1" | jq -sRr @uri
-        return
+        if printf '%s' "$1" | jq -sRr @uri; then
+            return 0
+        fi
     fi
 
     # Best-effort fallback (encodes spaces and slashes)
-    printf '%s' "$1" | sed 's/%/%25/g; s/ /%20/g; s,/,%%2F,g'
+    printf '%s\n' "$(printf '%s' "$1" | sed 's/%/%25/g; s/ /%20/g; s,/,%2F,g')"
 }
 
 ensure_apt_update() {
@@ -213,10 +269,10 @@ check_environment() {
 
 #------------------------------ Globals --------------------------------------#
 
-DOMAIN=""
-WS_PATH="/ws"
-UUID=""
-COVER_SITE="y"
+DOMAIN="${DOMAIN:-}"
+WS_PATH="${WS_PATH:-}"
+UUID="${UUID:-}"
+COVER_SITE="${COVER_SITE:-y}"
 NGINX_AVAILABLE=0
 CERT_TOOL="none"   # certbot | acme | none
 CERT_DIR=""
@@ -224,9 +280,9 @@ CERT_FILE=""
 KEY_FILE=""
 XRAY_BIN=""
 XRAY_CONFIG_PATH=""
-FRESH_INSTALL="y"
-SETUP_UFW="y"
-NON_INTERACTIVE=0
+FRESH_INSTALL="${FRESH_INSTALL:-y}"
+SETUP_UFW="${SETUP_UFW:-y}"
+NON_INTERACTIVE="${NON_INTERACTIVE:-0}"
 TOTAL_STEPS=12 # Keep in sync with progress_step calls in main
 CURRENT_STEP=0
 START_TS=0
@@ -234,52 +290,99 @@ APT_UPDATED=0
 
 #--------------------------- Interactive Input -------------------------------#
 
+require_option_value() {
+    local opt="$1" value="${2-}"
+    if [ -z "$value" ]; then
+        error "$opt requires a value."
+        usage
+        exit 2
+    fi
+    case "$value" in
+        --*)
+            error "$opt requires a value."
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+parse_yn_option() {
+    local opt="$1" value="$2" normalized
+    normalized=$(normalize_yn "$value")
+    if [ -z "$normalized" ]; then
+        error "$opt must be y/yes or n/no."
+        return 1
+    fi
+    printf '%s\n' "$normalized"
+}
+
+normalize_non_interactive() {
+    case "$(trim "$NON_INTERACTIVE" | tr 'A-Z' 'a-z')" in
+        1|true|y|yes) NON_INTERACTIVE=1 ;;
+        0|false|n|no|"") NON_INTERACTIVE=0 ;;
+        *)
+            error "NON_INTERACTIVE must be 0/1, true/false, or y/n."
+            exit 2
+            ;;
+    esac
+}
+
 parse_args() {
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --domain)
+                require_option_value "$1" "${2-}"
                 DOMAIN="$2"; shift 2 ;;
+            --domain=*)
+                DOMAIN="${1#*=}"; shift ;;
             --ws-path)
+                require_option_value "$1" "${2-}"
                 WS_PATH="$2"; shift 2 ;;
+            --ws-path=*)
+                WS_PATH="${1#*=}"; shift ;;
             --uuid)
+                require_option_value "$1" "${2-}"
                 UUID="$2"; shift 2 ;;
+            --uuid=*)
+                UUID="${1#*=}"; shift ;;
             --cover-site)
-                local val; val=$(normalize_yn "$2")
-                [ -n "$val" ] && COVER_SITE="$val"; shift 2 ;;
+                require_option_value "$1" "${2-}"
+                COVER_SITE=$(parse_yn_option "$1" "$2") || exit 2; shift 2 ;;
+            --cover-site=*)
+                COVER_SITE=$(parse_yn_option "--cover-site" "${1#*=}") || exit 2; shift ;;
             --fresh-install)
-                local val; val=$(normalize_yn "$2")
-                [ -n "$val" ] && FRESH_INSTALL="$val"; shift 2 ;;
+                require_option_value "$1" "${2-}"
+                FRESH_INSTALL=$(parse_yn_option "$1" "$2") || exit 2; shift 2 ;;
+            --fresh-install=*)
+                FRESH_INSTALL=$(parse_yn_option "--fresh-install" "${1#*=}") || exit 2; shift ;;
             --setup-ufw)
-                local val; val=$(normalize_yn "$2")
-                [ -n "$val" ] && SETUP_UFW="$val"; shift 2 ;;
+                require_option_value "$1" "${2-}"
+                SETUP_UFW=$(parse_yn_option "$1" "$2") || exit 2; shift 2 ;;
+            --setup-ufw=*)
+                SETUP_UFW=$(parse_yn_option "--setup-ufw" "${1#*=}") || exit 2; shift ;;
             --non-interactive|--yes)
                 NON_INTERACTIVE=1; shift ;;
             --help)
-                cat <<'EOF'
-Usage: setup.sh [options]
-  --domain <domain>         Domain name for the deployment (required in non-interactive mode)
-  --ws-path <path>          WebSocket path (e.g., /ws)
-  --uuid <uuid>             UUID to use; auto-generated if omitted
-  --cover-site <y|n>        Whether to generate the fake cover website
-  --fresh-install <y|n>     Whether to run apt-get update/upgrade as a fresh install
-  --setup-ufw <y|n>         Configure and enable UFW with 22/80/443 allowed
-  --non-interactive|--yes   Accept defaults without prompts (domain is still required)
-  --help                    Show this message
-EOF
+                usage
                 exit 0 ;;
             --)
                 shift; break ;;
             *)
-                warn "Unknown option: $1"; shift ;;
+                error "Unknown option: $1"
+                usage
+                exit 2 ;;
         esac
     done
+    normalize_non_interactive
 }
 
 prompt_inputs() {
+    local use_custom_uuid
+
     # 1. Domain
     while :; do
         if [ -n "$DOMAIN" ]; then
-            DOMAIN=$(printf '%s' "$DOMAIN" | tr -d '[:space:]')
+            DOMAIN=$(trim "$DOMAIN" | tr 'A-Z' 'a-z')
             if validate_domain "$DOMAIN"; then
                 break
             fi
@@ -293,7 +396,7 @@ prompt_inputs() {
         fi
         printf 'Enter your domain (e.g. example.com): '
         read -r DOMAIN
-        DOMAIN=$(printf '%s' "$DOMAIN" | tr -d '[:space:]')
+        DOMAIN=$(trim "$DOMAIN" | tr 'A-Z' 'a-z')
         if [ -z "$DOMAIN" ]; then
             echo "Domain cannot be empty."
             continue
@@ -330,32 +433,42 @@ prompt_inputs() {
     fi
 
     # 4. WebSocket path
-    if [ -z "$WS_PATH" ]; then
-        if [ "$NON_INTERACTIVE" -eq 1 ]; then
-            WS_PATH="/ws"
-        else
-            printf 'Enter WebSocket path (default /ws): '
-            read -r WS_PATH
-            WS_PATH=$(printf '%s' "$WS_PATH" | tr -d '[:space:]')
-            [ -z "$WS_PATH" ] && WS_PATH="/ws"
+    while :; do
+        if [ -z "$WS_PATH" ]; then
+            if [ "$NON_INTERACTIVE" -eq 1 ]; then
+                WS_PATH="/ws"
+            else
+                printf 'Enter WebSocket path (default /ws): '
+                read -r WS_PATH
+            fi
         fi
-    fi
-    WS_PATH=$(printf '%s' "$WS_PATH" | tr -d '[:space:]')
-    case "$WS_PATH" in
-        /*) : ;;
-        *)  WS_PATH="/$WS_PATH" ;;
-    esac
+
+        WS_PATH=$(trim "$WS_PATH")
+        [ -z "$WS_PATH" ] && WS_PATH="/ws"
+        case "$WS_PATH" in
+            /*) : ;;
+            *)  WS_PATH="/$WS_PATH" ;;
+        esac
+        if validate_ws_path "$WS_PATH"; then
+            break
+        fi
+
+        echo "Invalid WebSocket path. Use a path like /ws or /edge-1; only letters, numbers, '.', '_', '-', '~', and '/' are allowed, and '/' alone is not allowed."
+        [ "$NON_INTERACTIVE" -eq 1 ] && exit 1
+        WS_PATH=""
+    done
 
     # 5. UUID
     if [ -n "$UUID" ]; then
-        if ! printf '%s' "$UUID" | grep -Eq '^[0-9a-fA-F-]{36}$'; then
+        UUID=$(trim "$UUID" | tr 'A-F' 'a-f')
+        if ! validate_uuid "$UUID"; then
             echo "Invalid UUID format provided."
             [ "$NON_INTERACTIVE" -eq 1 ] && exit 1
             UUID=""
         fi
     fi
     if [ -z "$UUID" ]; then
-        local use_custom_uuid="n"
+        use_custom_uuid="n"
         if [ "$NON_INTERACTIVE" -eq 1 ]; then
             use_custom_uuid="n"
         else
@@ -365,8 +478,8 @@ prompt_inputs() {
             while :; do
                 printf 'Enter UUID (e.g. 550e8400-e29b-41d4-a716-446655440000): '
                 read -r UUID
-                UUID=$(printf '%s' "$UUID" | tr -d '[:space:]')
-                if printf '%s' "$UUID" | grep -Eq '^[0-9a-fA-F-]{36}$'; then
+                UUID=$(trim "$UUID" | tr 'A-F' 'a-f')
+                if validate_uuid "$UUID"; then
                     break
                 else
                     echo "Invalid UUID format. Please try again."
@@ -381,6 +494,7 @@ prompt_inputs() {
                 warn "Unable to auto-generate UUID (uuidgen and /proc unavailable), falling back to fixed placeholder (NOT recommended for production)."
                 UUID="550e8400-e29b-41d4-a716-446655440000"
             fi
+            UUID=$(trim "$UUID" | tr 'A-F' 'a-f')
         fi
     fi
 
@@ -418,6 +532,10 @@ system_prepare() {
         NGINX_AVAILABLE=1
     else
         NGINX_AVAILABLE=0
+        if [ "$NON_INTERACTIVE" -eq 1 ]; then
+            warn "Nginx installation failed. Proceeding without web server in non-interactive mode."
+            return 0
+        fi
         local retry
         retry=$(prompt_yes_no "Nginx installation failed. Retry? (y/n)" "n")
         if [ "$retry" = "y" ]; then
@@ -435,6 +553,11 @@ system_prepare() {
 install_acme() {
     # Attempt to install acme.sh if not already available
     if command -v acme.sh >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ -x /root/.acme.sh/acme.sh ]; then
+        PATH="/root/.acme.sh:$PATH"
+        export PATH
         return 0
     fi
 
@@ -483,7 +606,8 @@ select_cert_tool() {
 check_dns_health() {
     log "Checking DNS resolution for $DOMAIN."
     local resolved
-    resolved=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
+    resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
+    [ -z "$resolved" ] && resolved=$(getent hosts "$DOMAIN" 2>/dev/null | awk '$1 ~ /^[0-9.]+$/ {print $1; exit}')
     if [ -n "$resolved" ]; then
         log "System resolver OK: $DOMAIN -> $resolved"
     else
@@ -492,8 +616,8 @@ check_dns_health() {
 
         local resolver found_ip
         for resolver in 1.1.1.1 8.8.8.8 9.9.9.9; do
-            found_ip=$(dig +short @"$resolver" "$DOMAIN" 2>/dev/null | head -n 1)
-            [ -z "$found_ip" ] && found_ip=$(nslookup "$DOMAIN" "$resolver" 2>/dev/null | awk '/^Address: / {print $2; exit}')
+            found_ip=$(dig +short A @"$resolver" "$DOMAIN" 2>/dev/null | awk '/^[0-9.]+$/ {print; exit}')
+            [ -z "$found_ip" ] && found_ip=$(nslookup -type=A "$DOMAIN" "$resolver" 2>/dev/null | awk '/^Address: / && $2 !~ /#/ {print $2; exit}')
             if [ -n "$found_ip" ]; then
                 resolved="$found_ip"
                 log "Resolved via fallback DNS $resolver: $found_ip"
@@ -590,6 +714,16 @@ setup_certificates() {
             fi
         else
             warn "certbot certificate issuance failed."
+        fi
+    fi
+
+    if [ "$got_cert" -eq 0 ] && [ "$CERT_TOOL" != "acme" ]; then
+        warn "Trying acme.sh as fallback certificate client."
+        if install_acme; then
+            CERT_TOOL="acme"
+        else
+            CERT_TOOL="none"
+            warn "acme.sh fallback is unavailable; will use self-signed certificate."
         fi
     fi
 
@@ -732,6 +866,7 @@ install_xray() {
     fi
 
     local tmp_zip="/tmp/xray.zip" tmp_dir="/tmp/xray_extracted"
+    rm -rf "$tmp_dir" 2>/dev/null || true
     mkdir -p "$tmp_dir" 2>/dev/null || true
 
     local attempt=1 success=0
@@ -780,6 +915,57 @@ install_xray() {
     log "Xray installed at $XRAY_BIN."
 }
 
+write_xray_config() {
+    local output_path="$1"
+    cat > "$output_path" <<EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10000,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          {
+            "id": "$UUID",
+            "flow": "",
+            "email": "$DOMAIN"
+          }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "$WS_PATH",
+          "headers": {
+            "Host": "$DOMAIN"
+          }
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": {}
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "blocked"
+    }
+  ]
+}
+EOF
+}
+
 configure_xray() {
     # Determine preferred config path
     XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json"
@@ -806,108 +992,15 @@ configure_xray() {
         chmod 640 /var/log/xray/access.log /var/log/xray/error.log 2>/dev/null || true
     fi
 
-    cat > "$tmp_config" <<EOF
-{
-  "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "listen": "127.0.0.1",
-      "port": 10000,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "",
-            "email": "$DOMAIN"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": {
-          "path": "$WS_PATH",
-          "headers": {
-            "Host": "$DOMAIN"
-          }
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    },
-    {
-      "protocol": "blackhole",
-      "settings": {},
-      "tag": "blocked"
-    }
-  ]
-}
-EOF
+    if ! write_xray_config "$tmp_config"; then
+        error "Failed to write temporary Xray config at $tmp_config."
+        return 1
+    fi
 
     if command -v jq >/dev/null 2>&1; then
         if ! jq . "$tmp_config" >/dev/null 2>&1; then
-            warn "Generated Xray config failed jq validation; attempting rewrite."
-            # Rewrite identically and re-validate
-            cat > "$tmp_config" <<EOF
-{
-  "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
-  },
-  "inbounds": [
-    {
-      "listen": "127.0.0.1",
-      "port": 10000,
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "",
-            "email": "$DOMAIN"
-          }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "security": "none",
-        "wsSettings": {
-          "path": "$WS_PATH",
-          "headers": {
-            "Host": "$DOMAIN"
-          }
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    },
-    {
-      "protocol": "blackhole",
-      "settings": {},
-      "tag": "blocked"
-    }
-  ]
-}
-EOF
-            if ! jq . "$tmp_config" >/dev/null 2>&1; then
-                error "Xray config JSON remains invalid. Please review $tmp_config manually."
-            fi
+            error "Generated Xray config JSON is invalid. Please review $tmp_config manually."
+            return 1
         fi
     fi
 
@@ -936,12 +1029,13 @@ setup_xray_service() {
     cat > "$service_path" <<EOF
 [Unit]
 Description=Xray Service
-After=network.target
+Documentation=https://github.com/xtls
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=$XRAY_BIN -config $XRAY_CONFIG_PATH
+ExecStart=$XRAY_BIN run -config $XRAY_CONFIG_PATH
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=1048576
@@ -1017,7 +1111,7 @@ server {
     index index.html index.htm;
 
     # WebSocket VLESS path
-    location $WS_PATH {
+    location = $WS_PATH {
         proxy_pass http://127.0.0.1:10000;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
