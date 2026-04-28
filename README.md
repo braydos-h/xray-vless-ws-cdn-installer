@@ -1,5 +1,27 @@
 # VLESS WebSocket + CDN Tunnel Setup
 
+> [!WARNING]
+> ## ⚠️ Project Status: Archived (Read-Only)
+> This repository is now in **read-only archived mode** and is no longer actively maintained.
+>
+> For all new deployments, use the maintained replacement project:
+>
+> ## 👉 [vless-xtls-vision-installer](https://github.com/braydos-h/vless-xtls-vision-installer)
+>
+> The newer installer provides:
+> - `VLESS + REALITY + XTLS Vision`
+> - simpler deployment flow with fewer moving parts
+> - no requirement to manage TLS certificates or reverse proxies
+> - no requirement to own/configure a domain for standard setups
+> - integrated diagnostics, repair, update, and status commands
+> - built-in firewall and SSH hardening options
+> - automatic client config + QR export generation
+> - active maintenance and ongoing improvements
+>
+> Existing deployments from this repository may continue working, but all future development and support has moved to the new project.
+>
+> **Migration recommendation:** keep current nodes online until your new `vless-xtls-vision-installer` node is fully validated, then rotate clients in batches to minimize downtime.
+
 Automated Bash installer that deploys an Xray VLESS-over-WebSocket endpoint behind Nginx plus a CDN-friendly cover site. It handles TLS certificates, writes an Xray config, and prints a ready-to-import VLESS URI so you can connect through a CDN-backed domain quickly.
 
 ---
