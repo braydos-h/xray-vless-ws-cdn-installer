@@ -13,6 +13,16 @@ sudo ./setup.sh
 
 > Ensure DNS for your domain already points at the server before running, so certificate issuance succeeds on the first try. See [Quick Start](#quick-start) for the interactive prompts and [CLI Reference](#cli-reference) for non-interactive flags.
 
+## Demo Videos
+
+**before.mp4** - Live run showing the full automated setup and timing (2m41s on 1vCPU/1GB RAM).
+
+<video src="https://github.com/braydos-h/xray-vless-ws-cdn-installer/raw/main/before.mp4" controls muted width="100%"></video>
+
+**after.mp4** - Example of connecting and using the deployed endpoint.
+
+<video src="https://github.com/braydos-h/xray-vless-ws-cdn-installer/raw/main/after.mp4" controls muted width="100%"></video>
+
 ---
 
 ## Table of Contents
@@ -232,24 +242,6 @@ This setup is designed to sit behind a CDN. With Cloudflare:
 4. Make sure **WebSocket** is enabled under Network settings (it's on by default).
 
 The CDN terminates public TLS and forwards WebSocket frames to Nginx on your origin. Because the cover site serves normal HTML on `/`, shallow inspection sees only a typical CDN-fronted website.
-
-[Back to top](#vless-websocket--cdn-tunnel-setup)
-
----
-
-## Demo Videos
-
-**before.mp4** - Live run showing the full automated setup and timing (2m41s on 1vCPU/1GB RAM).
-
-https://github.com/user-attachments/assets/1fc29b93-b1f5-465b-b416-b6fe3db50c06
-
-<video src="https://github.com/braydos-h/xray-vless-ws-cdn-installer/raw/main/before.mp4" controls muted width="100%"></video>
-
-**after.mp4** - Example of connecting and using the deployed endpoint.
-
-https://github.com/user-attachments/assets/f055a043-8f10-4b8f-bd05-72cfdd860af0
-
-<video src="https://github.com/braydos-h/xray-vless-ws-cdn-installer/raw/main/after.mp4" controls muted width="100%"></video>
 
 [Back to top](#vless-websocket--cdn-tunnel-setup)
 
