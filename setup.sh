@@ -42,18 +42,8 @@ trim() {
 }
 
 format_duration() {
-    # Format seconds into Hh Mm Ss
-    local secs=$1
-    local h=$((secs / 3600))
-    local m=$(((secs % 3600) / 60))
-    local s=$((secs % 60))
-    if [ "$h" -gt 0 ]; then
-        printf '%02dh %02dm %02ds' "$h" "$m" "$s"
-    elif [ "$m" -gt 0 ]; then
-        printf '%02dm %02ds' "$m" "$s"
-    else
-        printf '00m %02ds' "$s"
-    fi
+    local s=$1
+    printf '%02dh %02dm %02ds' $((s/3600)) $(((s%3600)/60)) $((s%60))
 }
 
 progress_init() {
@@ -63,32 +53,20 @@ progress_init() {
 }
 
 progress_step() {
-    # Increment progress and print a simple bar with ETA
     local desc="$1"
     CURRENT_STEP=$((CURRENT_STEP + 1))
     local elapsed=$(( $(date +%s) - START_TS ))
     local avg_per_step=0
-    if [ "$CURRENT_STEP" -gt 0 ]; then
-        avg_per_step=$(( elapsed / CURRENT_STEP ))
-    fi
+    [ "$CURRENT_STEP" -gt 0 ] && avg_per_step=$(( elapsed / CURRENT_STEP ))
     local remaining=$(( TOTAL_STEPS - CURRENT_STEP ))
-    if [ "$remaining" -lt 0 ]; then
-        remaining=0
-    fi
+    [ "$remaining" -lt 0 ] && remaining=0
     local eta=$(( remaining * avg_per_step ))
     local percent=$(( CURRENT_STEP * 100 / TOTAL_STEPS ))
     local bar_len=26
     local filled=$(( percent * bar_len / 100 ))
-    local bar=""
-    local i=1
-    while [ "$i" -le "$bar_len" ]; do
-        if [ "$i" -le "$filled" ]; then
-            bar="${bar}#"
-        else
-            bar="${bar}."
-        fi
-        i=$((i + 1))
-    done
+    local bar
+    bar=$(printf '%*s' "$filled" '' | tr ' ' '#')
+    bar+=$(printf '%*s' $((bar_len - filled)) '' | tr ' ' .)
     printf '\n[%d/%d] %s\n[%s] %3d%% | elapsed %s | ETA %s\n' \
         "$CURRENT_STEP" "$TOTAL_STEPS" "$desc" \
         "$bar" "$percent" "$(format_duration "$elapsed")" "$(format_duration "$eta")"
@@ -185,28 +163,6 @@ ensure_root() {
             exit 1
         fi
     fi
-}
-
-url_encode() {
-    # Use python3 for robust URL encoding of arbitrary characters
-    if command -v python3 >/dev/null 2>&1; then
-        if python3 - "$1" 2>/dev/null <<'PY'
-import sys, urllib.parse
-print(urllib.parse.quote(sys.argv[1], safe=""))
-PY
-        then
-            return 0
-        fi
-    fi
-
-    if command -v jq >/dev/null 2>&1; then
-        if printf '%s' "$1" | jq -sRr @uri; then
-            return 0
-        fi
-    fi
-
-    # Best-effort fallback (encodes spaces and slashes)
-    printf '%s\n' "$(printf '%s' "$1" | sed 's/%/%25/g; s/ /%20/g; s,/,%2F,g')"
 }
 
 ensure_apt_update() {
@@ -320,10 +276,7 @@ normalize_non_interactive() {
     case "$(trim "$NON_INTERACTIVE" | tr 'A-Z' 'a-z')" in
         1|true|y|yes) NON_INTERACTIVE=1 ;;
         0|false|n|no|"") NON_INTERACTIVE=0 ;;
-        *)
-            error "NON_INTERACTIVE must be 0/1, true/false, or y/n."
-            exit 2
-            ;;
+        *) error "NON_INTERACTIVE must be 0/1, true/false, or y/n."; exit 2 ;;
     esac
 }
 
@@ -1209,7 +1162,6 @@ enable_and_start_services() {
     fi
 
     if [ -n "$XRAY_BIN" ]; then
-        systemctl enable xray >/dev/null 2>&1 || warn "Could not enable xray service (might already be enabled)."
         manage_service xray restart
     fi
 }
@@ -1260,8 +1212,8 @@ main() {
     enable_and_start_services
 
     # URL-encode the WebSocket path for the VLESS URI
-    local encoded_path
-    encoded_path=$(url_encode "$WS_PATH")
+    # WS_PATH is pre-validated to ^/[A-Za-z0-9._~/-]+$ ; only '/' needs encoding in a query param
+    local encoded_path="${WS_PATH//\//%2F}"
 
     local vless_uri
     vless_uri="vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=$encoded_path"
