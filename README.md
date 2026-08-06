@@ -17,11 +17,11 @@ sudo ./setup.sh
 
 **before.mp4** - Live run showing the full automated setup and timing (2m41s on 1vCPU/1GB RAM).
 
-<video src="https://github.com/braydos-h/xray-vless-ws-cdn-installer/raw/main/before.mp4" controls muted width="100%"></video>
+https://github.com/user-attachments/assets/1fc29b93-b1f5-465b-b416-b6fe3db50c06
 
 **after.mp4** - Example of connecting and using the deployed endpoint.
 
-<video src="https://github.com/braydos-h/xray-vless-ws-cdn-installer/raw/main/after.mp4" controls muted width="100%"></video>
+https://github.com/user-attachments/assets/f055a043-8f10-4b8f-bd05-72cfdd860af0
 
 ---
 
